@@ -66,7 +66,13 @@ def get_argparser():
     parser.add_argument("--continue_training", action='store_true', default=False)
 
     parser.add_argument("--loss_type", type=str, default='cross_entropy',
-                        choices=['cross_entropy', 'focal_loss'], help="loss type (default: False)")
+                        choices=['cross_entropy', 'focal_loss'], help="loss type")
+    parser.add_argument("--focal_gamma", type=float, default=2.0,
+                        help="focal loss gamma (default: 2.0; 0 is equivalent to CE)")
+    parser.add_argument("--focal_alpha", type=float, default=1.0,
+                        help="focal loss alpha when class_weights is not set")
+    parser.add_argument("--class_weights", type=str, default=None,
+                        help='optional per-class weights, e.g. "1,1,1,2,1,1,1,1.5"')
     parser.add_argument("--gpu_id", type=str, default='0',
                         help="GPU ID")
     parser.add_argument("--weight_decay", type=float, default=1e-4,
@@ -285,11 +291,27 @@ def main():
         scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=opts.step_size, gamma=0.1)
 
     # Set up criterion
-    # criterion = utils.get_loss(opts.loss_type)
+    class_weights = None
+    if opts.class_weights:
+        weights = [float(x.strip()) for x in opts.class_weights.split(',')]
+        class_weights = torch.tensor(weights, dtype=torch.float32, device=device)
+        if opts.num_classes and len(weights) != opts.num_classes:
+            raise ValueError(
+                f"class_weights length ({len(weights)}) must match num_classes ({opts.num_classes})")
+
     if opts.loss_type == 'focal_loss':
-        criterion = utils.FocalLoss(ignore_index=255, size_average=True)
+        alpha = class_weights if class_weights is not None else opts.focal_alpha
+        criterion = utils.FocalLoss(
+            alpha=alpha,
+            gamma=opts.focal_gamma,
+            ignore_index=255,
+            size_average=True,
+        )
+        print("Loss: FocalLoss(gamma=%s, alpha=%s)" % (opts.focal_gamma, alpha))
     elif opts.loss_type == 'cross_entropy':
-        criterion = nn.CrossEntropyLoss(ignore_index=255, reduction='mean')
+        criterion = nn.CrossEntropyLoss(
+            weight=class_weights, ignore_index=255, reduction='mean')
+        print("Loss: CrossEntropyLoss(class_weights=%s)" % class_weights)
 
     def save_ckpt(path):
         """ save current model
