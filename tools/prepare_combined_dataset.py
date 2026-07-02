@@ -15,28 +15,22 @@ import numpy as np
 from PIL import Image
 from tqdm import tqdm
 
-# DeepGlobe RGB -> unified class id
-DEEPGLOBE_RGB_TO_ID = {
-    (0, 0, 0): 0,          # unknown -> background
-    (0, 0, 255): 1,        # water
-    (0, 255, 0): 2,        # forest
-    (255, 0, 255): 3,      # rangeland -> grassland
-    (255, 255, 0): 4,      # agriculture -> farmland
-    (255, 255, 255): 5,    # barren
-    (0, 255, 255): 6,      # urban -> building
+DEEPGLOBE_LUT = {
+    (rgb_val[0] << 16) | (rgb_val[1] << 8) | rgb_val[2]: cls_id
+    for rgb_val, cls_id in {
+        (0, 0, 0): 0,
+        (0, 0, 255): 1,
+        (0, 255, 0): 2,
+        (255, 0, 255): 3,
+        (255, 255, 0): 4,
+        (255, 255, 255): 5,
+        (0, 255, 255): 6,
+    }.items()
 }
 
-# LoveDA index -> unified class id (0=no-data -> ignore)
-LOVEDA_TO_UNIFIED = {
-    0: 255,
-    1: 0,
-    2: 6,
-    3: 7,
-    4: 1,
-    5: 5,
-    6: 2,
-    7: 4,
-}
+LOVEDA_LUT = np.full(256, 255, dtype=np.uint8)
+for _src, _dst in {0: 255, 1: 0, 2: 6, 3: 7, 4: 1, 5: 5, 6: 2, 7: 4}.items():
+    LOVEDA_LUT[_src] = _dst
 
 CLASS_INFO = [
     {"id": 0, "name": "background", "name_zh": "背景", "color": [0, 0, 0]},
@@ -89,30 +83,45 @@ def preview_tile_grid(size: int, tile_size: int, stride: int) -> tuple[int, list
 
 
 def deepglobe_rgb_to_mask(rgb: np.ndarray) -> np.ndarray:
-    mask = np.zeros(rgb.shape[:2], dtype=np.uint8)
-    for rgb_val, cls_id in DEEPGLOBE_RGB_TO_ID.items():
-        match = np.all(rgb == np.array(rgb_val, dtype=np.uint8), axis=-1)
-        mask[match] = cls_id
-    return mask
+    packed = (
+        rgb[..., 0].astype(np.uint32) << 16
+        | rgb[..., 1].astype(np.uint32) << 8
+        | rgb[..., 2].astype(np.uint32)
+    )
+    flat = packed.ravel()
+    unique, inv = np.unique(flat, return_inverse=True)
+    mapped = np.fromiter(
+        (DEEPGLOBE_LUT.get(int(u), 0) for u in unique),
+        dtype=np.uint8,
+        count=len(unique),
+    )
+    return mapped[inv].reshape(rgb.shape[:2])
 
 
 def loveda_to_mask(arr: np.ndarray) -> np.ndarray:
-    out = np.full(arr.shape, 255, dtype=np.uint8)
-    for src_id, dst_id in LOVEDA_TO_UNIFIED.items():
-        out[arr == src_id] = dst_id
-    return out
+    return LOVEDA_LUT[arr]
 
 
 def valid_ratio(mask: np.ndarray) -> float:
-    valid = mask != 255
-    return float(valid.sum()) / mask.size
+    return float((mask != 255).sum()) / mask.size
 
 
-def save_pair(img_arr, mask_arr, img_path: Path, mask_path: Path):
+def update_stats_from_mask(stats: Counter, mask: np.ndarray):
+    valid = mask.ravel()
+    valid = valid[valid != 255]
+    if valid.size == 0:
+        return
+    counts = np.bincount(valid.astype(np.int64), minlength=8)
+    for cls_id, count in enumerate(counts):
+        if count:
+            stats[cls_id] += int(count)
+
+
+def save_pair(img_arr, mask_arr, img_path: Path, mask_path: Path, compress_level: int = 1):
     img_path.parent.mkdir(parents=True, exist_ok=True)
     mask_path.parent.mkdir(parents=True, exist_ok=True)
-    Image.fromarray(img_arr).save(img_path)
-    Image.fromarray(mask_arr, mode="L").save(mask_path)
+    Image.fromarray(img_arr).save(img_path, compress_level=compress_level)
+    Image.fromarray(mask_arr, mode="L").save(mask_path, compress_level=compress_level)
 
 
 def process_deepglobe(
@@ -131,26 +140,24 @@ def process_deepglobe(
         return
 
     with metadata.open(newline="", encoding="utf-8") as f:
-        rows = list(csv.DictReader(f))
+        rows = [
+            row for row in csv.DictReader(f)
+            if row["split"] in split_map and row.get("mask_path")
+        ]
 
     for row in tqdm(rows, desc="DeepGlobe"):
-        split = row["split"]
-        if split not in split_map:
-            continue
-
-        out_split = split_map[split]
+        out_split = split_map[row["split"]]
         sat_rel = row["sat_image_path"].replace("\\", "/")
-        mask_rel = row.get("mask_path", "").replace("\\", "/")
-        if not mask_rel:
-            continue
+        mask_rel = row["mask_path"].replace("\\", "/")
 
         img_path = root / sat_rel
         mask_path = root / mask_rel
         if not img_path.exists() or not mask_path.exists():
             continue
 
-        image = np.array(Image.open(img_path).convert("RGB"))
-        mask_full = deepglobe_rgb_to_mask(np.array(Image.open(mask_path).convert("RGB")))
+        with Image.open(img_path) as img_f, Image.open(mask_path) as mask_f:
+            image = np.asarray(img_f.convert("RGB"))
+            mask_full = deepglobe_rgb_to_mask(np.asarray(mask_f.convert("RGB")))
         h, w = image.shape[:2]
 
         xs = tile_starts(w, tile_size, stride)
@@ -175,7 +182,7 @@ def process_deepglobe(
                 rel_img = f"images/{out_split}/{name}"
                 rel_mask = f"masks/{out_split}/{name}"
                 manifest[out_split].append((rel_img, rel_mask))
-                stats.update(tile_mask[tile_mask != 255].tolist())
+                update_stats_from_mask(stats, tile_mask)
 
 
 def process_loveda(
@@ -204,8 +211,8 @@ def process_loveda(
                 if not mask_path.exists():
                     continue
 
-                image = np.array(Image.open(img_path).convert("RGB"))
-                mask = loveda_to_mask(np.array(Image.open(mask_path)))
+                image = np.asarray(Image.open(img_path).convert("RGB"))
+                mask = loveda_to_mask(np.asarray(Image.open(mask_path)))
                 if valid_ratio(mask) < min_valid_ratio:
                     continue
 
@@ -218,7 +225,7 @@ def process_loveda(
                 rel_img = f"images/{out_split}/{name}"
                 rel_mask = f"masks/{out_split}/{name}"
                 manifest[out_split].append((rel_img, rel_mask))
-                stats.update(mask[mask != 255].tolist())
+                update_stats_from_mask(stats, mask)
 
 
 def write_manifest(output_root: Path, manifest: dict[str, list]):
