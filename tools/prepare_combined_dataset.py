@@ -1,7 +1,8 @@
 """
 Merge DeepGlobe + LoveDA into combine_data with unified labels and 1024 tiles.
 
-Default stride=1024 (tile size): 2048->2x2=4 tiles, 2448->3x3=9 tiles, full coverage.
+DeepGlobe: all train images -> train; a held-out subset is also copied to val.
+LoveDA: Train -> train, Val -> val.
 """
 from __future__ import annotations
 
@@ -124,36 +125,65 @@ def save_pair(img_arr, mask_arr, img_path: Path, mask_path: Path, compress_level
     Image.fromarray(mask_arr, mode="L").save(mask_path, compress_level=compress_level)
 
 
+def select_deepglobe_val_image_ids(
+    rows: list[dict],
+    val_ratio: float,
+    seed: int,
+) -> set[str]:
+    """Pick DeepGlobe train image_ids to copy into val; train keeps all images."""
+    image_ids = sorted({row["image_id"] for row in rows})
+    if not image_ids or val_ratio <= 0:
+        return set()
+
+    rng = np.random.default_rng(seed)
+    shuffled = list(image_ids)
+    rng.shuffle(shuffled)
+
+    n_val = int(round(len(shuffled) * val_ratio))
+    n_val = max(1, min(n_val, len(shuffled)))
+    return set(shuffled[:n_val])
+
+
+def load_deepglobe_train_rows(root: Path) -> list[dict]:
+    metadata = root / "metadata.csv"
+    if not metadata.exists():
+        return []
+
+    rows = []
+    with metadata.open(newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            if row.get("split") != "train" or not row.get("mask_path"):
+                continue
+            sat_rel = row["sat_image_path"].replace("\\", "/")
+            mask_rel = row["mask_path"].replace("\\", "/")
+            if (root / sat_rel).exists() and (root / mask_rel).exists():
+                rows.append(row)
+    return rows
+
+
 def process_deepglobe(
     root: Path,
     output_root: Path,
     tile_size: int,
     stride: int,
     min_valid_ratio: float,
-    split_map: dict[str, str],
+    val_image_ids: set[str],
     stats: Counter,
     manifest: dict[str, list],
 ):
-    metadata = root / "metadata.csv"
-    if not metadata.exists():
-        print(f"[WARN] DeepGlobe metadata not found: {metadata}")
+    rows = load_deepglobe_train_rows(root)
+    if not rows:
+        print("[WARN] No DeepGlobe train rows with masks found")
         return
 
-    with metadata.open(newline="", encoding="utf-8") as f:
-        rows = [
-            row for row in csv.DictReader(f)
-            if row["split"] in split_map and row.get("mask_path")
-        ]
-
     for row in tqdm(rows, desc="DeepGlobe"):
-        out_split = split_map[row["split"]]
+        image_id = row["image_id"]
+        copy_to_val = image_id in val_image_ids
         sat_rel = row["sat_image_path"].replace("\\", "/")
         mask_rel = row["mask_path"].replace("\\", "/")
 
         img_path = root / sat_rel
         mask_path = root / mask_rel
-        if not img_path.exists() or not mask_path.exists():
-            continue
 
         with Image.open(img_path) as img_f, Image.open(mask_path) as mask_f:
             image = np.asarray(img_f.convert("RGB"))
@@ -162,7 +192,6 @@ def process_deepglobe(
 
         xs = tile_starts(w, tile_size, stride)
         ys = tile_starts(h, tile_size, stride)
-        image_id = row["image_id"]
 
         for y in ys:
             for x in xs:
@@ -175,14 +204,22 @@ def process_deepglobe(
                     continue
 
                 name = f"dg_{image_id}_x{x}_y{y}.png"
-                out_img = output_root / "images" / out_split / name
-                out_mask = output_root / "masks" / out_split / name
-                save_pair(tile_img, tile_mask, out_img, out_mask)
+                rel_img = f"images/train/{name}"
+                rel_mask = f"masks/train/{name}"
 
-                rel_img = f"images/{out_split}/{name}"
-                rel_mask = f"masks/{out_split}/{name}"
-                manifest[out_split].append((rel_img, rel_mask))
+                out_img_train = output_root / rel_img
+                out_mask_train = output_root / rel_mask
+                save_pair(tile_img, tile_mask, out_img_train, out_mask_train)
+                manifest["train"].append((rel_img, rel_mask))
                 update_stats_from_mask(stats, tile_mask)
+
+                if copy_to_val:
+                    rel_img_val = f"images/val/{name}"
+                    rel_mask_val = f"masks/val/{name}"
+                    out_img_val = output_root / rel_img_val
+                    out_mask_val = output_root / rel_mask_val
+                    save_pair(tile_img, tile_mask, out_img_val, out_mask_val)
+                    manifest["val"].append((rel_img_val, rel_mask_val))
 
 
 def process_loveda(
@@ -225,7 +262,8 @@ def process_loveda(
                 rel_img = f"images/{out_split}/{name}"
                 rel_mask = f"masks/{out_split}/{name}"
                 manifest[out_split].append((rel_img, rel_mask))
-                update_stats_from_mask(stats, mask)
+                if out_split == "train":
+                    update_stats_from_mask(stats, mask)
 
 
 def write_manifest(output_root: Path, manifest: dict[str, list]):
@@ -236,7 +274,13 @@ def write_manifest(output_root: Path, manifest: dict[str, list]):
                 f.write(f"{img_rel} {mask_rel}\n")
 
 
-def write_meta(output_root: Path, stats: Counter, manifest: dict[str, list], args):
+def write_meta(
+    output_root: Path,
+    stats: Counter,
+    manifest: dict[str, list],
+    args,
+    deepglobe_split_info: dict | None = None,
+):
     class_names = {
         "num_classes": 8,
         "ignore_index": 255,
@@ -262,10 +306,18 @@ def write_meta(output_root: Path, stats: Counter, manifest: dict[str, list], arg
         "val_samples": len(manifest["val"]),
         "tile_size": args.tile_size,
         "stride": args.stride,
+        "deepglobe_val_ratio": args.deepglobe_val_ratio,
+        "split_seed": args.seed,
         "class_pixels": class_stats,
     }
+    if deepglobe_split_info:
+        summary["deepglobe_split"] = deepglobe_split_info
     with (output_root / "stats.json").open("w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
+
+    if deepglobe_split_info:
+        with (output_root / "deepglobe_split.json").open("w", encoding="utf-8") as f:
+            json.dump(deepglobe_split_info, f, ensure_ascii=False, indent=2)
 
 
 def main():
@@ -294,24 +346,59 @@ def main():
         default=0.0,
         help="skip tiles with less valid labeled pixels (0~1)",
     )
+    parser.add_argument(
+        "--deepglobe_val_ratio",
+        type=float,
+        default=0.2,
+        help="copy this fraction of DeepGlobe train images into val (train keeps all)",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="random seed for DeepGlobe train/val split by image",
+    )
     args = parser.parse_args()
 
     output_root = Path(args.output_root)
     output_root.mkdir(parents=True, exist_ok=True)
 
-    split_map_dg = {"train": "train", "valid": "val"}
+    deepglobe_root = Path(args.deepglobe_root)
+    dg_rows = load_deepglobe_train_rows(deepglobe_root)
+    dg_val_ids = sorted(select_deepglobe_val_image_ids(dg_rows, args.deepglobe_val_ratio, args.seed))
+    dg_all_ids = sorted({row["image_id"] for row in dg_rows})
+    deepglobe_split_info = {
+        "val_ratio": args.deepglobe_val_ratio,
+        "seed": args.seed,
+        "train_image_count": len(dg_all_ids),
+        "val_image_count": len(dg_val_ids),
+        "all_train_image_ids": dg_all_ids,
+        "val_image_ids": dg_val_ids,
+        "strategy": "copy_to_val",
+        "note": (
+            "All DeepGlobe train images stay in train; val_image_ids are copied to val. "
+            "DeepGlobe official valid/test have no masks."
+        ),
+    }
+
     split_map_ld = {"Train": "train", "Val": "val"}
 
     stats = Counter()
     manifest = defaultdict(list)
 
+    print(
+        f"DeepGlobe: all {len(dg_all_ids)} images -> train, "
+        f"copy {len(dg_val_ids)} images -> val "
+        f"(ratio={args.deepglobe_val_ratio}, seed={args.seed})"
+    )
+
     process_deepglobe(
-        Path(args.deepglobe_root),
+        deepglobe_root,
         output_root,
         args.tile_size,
         args.stride,
         args.min_valid_ratio,
-        split_map_dg,
+        set(dg_val_ids),
         stats,
         manifest,
     )
@@ -325,18 +412,29 @@ def main():
     )
 
     write_manifest(output_root, manifest)
-    write_meta(output_root, stats, manifest, args)
+    write_meta(output_root, stats, manifest, args, deepglobe_split_info)
 
     n2048, s2048 = preview_tile_grid(2048, args.tile_size, args.stride)
     n2448, s2448 = preview_tile_grid(2448, args.tile_size, args.stride)
+    dg_train_tiles = sum(1 for p in manifest["train"] if "/dg_" in p[0])
+    dg_val_tiles = sum(1 for p in manifest["val"] if "/dg_" in p[0])
+    ld_train_tiles = sum(1 for p in manifest["train"] if "/loveda_" in p[0])
+    ld_val_tiles = sum(1 for p in manifest["val"] if "/loveda_" in p[0])
     print("\n=== Done ===")
     print(f"Output: {output_root}")
     print(f"Tile size: {args.tile_size}, stride: {args.stride}")
     print(f"2048 image grid: {n2048}x{n2048}={n2048 ** 2} tiles, starts={s2048}")
     print(f"2448 image grid: {n2448}x{n2448}={n2448 ** 2} tiles, starts={s2448}")
-    print(f"Train samples: {len(manifest['train'])}")
-    print(f"Val samples:   {len(manifest['val'])}")
+    print(
+        f"Train samples: {len(manifest['train'])} "
+        f"(DeepGlobe: {dg_train_tiles}, LoveDA: {ld_train_tiles})"
+    )
+    print(
+        f"Val samples:   {len(manifest['val'])} "
+        f"(DeepGlobe copied: {dg_val_tiles}, LoveDA: {ld_val_tiles})"
+    )
     print(f"Grassland pixels: {stats.get(3, 0)} ({stats.get(3, 0) / max(sum(stats.values()), 1):.4%})")
+    print(f"Split file: {output_root / 'deepglobe_split.json'}")
 
 
 if __name__ == "__main__":
