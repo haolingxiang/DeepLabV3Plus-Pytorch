@@ -3,6 +3,8 @@ Merge DeepGlobe + LoveDA into combine_data with unified labels and 1024 tiles.
 
 Default stride=1024 (tile size): 2048->2x2=4 tiles, 2448->3x3=9 tiles, full coverage.
 """
+from __future__ import annotations
+
 import argparse
 import csv
 import json
