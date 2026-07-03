@@ -7,14 +7,14 @@ from PIL import Image
 
 
 DEFAULT_CLASSES = [
-    {"id": 0, "name": "background", "color": [0, 0, 0]},
-    {"id": 1, "name": "water", "color": [0, 0, 255]},
-    {"id": 2, "name": "forest", "color": [0, 255, 0]},
-    {"id": 3, "name": "grassland", "color": [255, 0, 255]},
-    {"id": 4, "name": "farmland", "color": [255, 255, 0]},
-    {"id": 5, "name": "barren", "color": [200, 200, 200]},
-    {"id": 6, "name": "building", "color": [0, 255, 255]},
-    {"id": 7, "name": "road", "color": [255, 128, 0]},
+    {"id": 0, "name": "background", "name_zh": "背景", "color": [0, 0, 0]},
+    {"id": 1, "name": "water", "name_zh": "水体", "color": [0, 0, 255]},
+    {"id": 2, "name": "forest", "name_zh": "森林", "color": [0, 255, 0]},
+    {"id": 3, "name": "grassland", "name_zh": "草地", "color": [255, 0, 255]},
+    {"id": 4, "name": "farmland", "name_zh": "农田", "color": [255, 255, 0]},
+    {"id": 5, "name": "barren", "name_zh": "裸地", "color": [200, 200, 200]},
+    {"id": 6, "name": "building", "name_zh": "建筑", "color": [0, 255, 255]},
+    {"id": 7, "name": "road", "name_zh": "道路", "color": [255, 128, 0]},
 ]
 
 

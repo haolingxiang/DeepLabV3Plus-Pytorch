@@ -1,23 +1,19 @@
-from torch.utils.data import dataset
 from tqdm import tqdm
 import network
 import utils
 import os
-import random
 import argparse
-import numpy as np
+from pathlib import Path
 
-from torch.utils import data
-from datasets import VOCSegmentation, Cityscapes, CombinedLandCover, cityscapes
+from datasets import VOCSegmentation, Cityscapes, CombinedLandCover
 from torchvision import transforms as T
-from metrics import StreamSegMetrics
+from utils.tiled_inference import infer_image
+from utils.inference_export import export_prediction, load_combined_class_info
 
 import torch
 import torch.nn as nn
 
 from PIL import Image
-import matplotlib
-import matplotlib.pyplot as plt
 from glob import glob
 
 def get_argparser():
@@ -45,13 +41,23 @@ def get_argparser():
     parser.add_argument("--save_val_results_to", default=None,
                         help="save segmentation results to the specified dir")
 
-    parser.add_argument("--crop_val", action='store_true', default=False,
-                        help='crop validation (default: False)')
-    parser.add_argument("--val_batch_size", type=int, default=4,
-                        help='batch size for validation (default: 4)')
-    parser.add_argument("--crop_size", type=int, default=513)
+    parser.add_argument("--tile_size", type=int, default=1024,
+                        help="tile size for pad/slide-window inference (default: 1024)")
+    parser.add_argument("--stride", type=int, default=1024,
+                        help="sliding window stride for large images (default: 1024)")
+    parser.add_argument(
+        "--data_root",
+        type=str,
+        default=None,
+        help="combine_data root for loading class_names.json (combined dataset)",
+    )
+    parser.add_argument(
+        "--no_save_pixel_zh",
+        action="store_true",
+        default=False,
+        help="skip per-pixel Chinese class npz (saves disk space)",
+    )
 
-    
     parser.add_argument("--ckpt", default=None, type=str,
                         help="resume from checkpoint")
     parser.add_argument("--gpu_id", type=str, default='0',
@@ -60,6 +66,7 @@ def get_argparser():
 
 def main():
     opts = get_argparser().parse_args()
+    class_info = None
     if opts.dataset.lower() == 'voc':
         opts.num_classes = 21
         decode_fn = VOCSegmentation.decode_target
@@ -69,6 +76,7 @@ def main():
     elif opts.dataset.lower() == 'combined':
         opts.num_classes = 8
         decode_fn = CombinedLandCover.decode_target
+        class_info = load_combined_class_info(opts.data_root)
 
     os.environ['CUDA_VISIBLE_DEVICES'] = opts.gpu_id
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -103,38 +111,40 @@ def main():
         model = nn.DataParallel(model)
         model.to(device)
 
-    #denorm = utils.Denormalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])  # denormalization for ori images
-
-    if opts.crop_val:
-        transform = T.Compose([
-                T.Resize(opts.crop_size),
-                T.CenterCrop(opts.crop_size),
-                T.ToTensor(),
-                T.Normalize(mean=[0.485, 0.456, 0.406],
-                                std=[0.229, 0.224, 0.225]),
-            ])
-    else:
-        transform = T.Compose([
-                T.ToTensor(),
-                T.Normalize(mean=[0.485, 0.456, 0.406],
-                                std=[0.229, 0.224, 0.225]),
-            ])
+    transform = T.Compose([
+        T.ToTensor(),
+        T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
     if opts.save_val_results_to is not None:
         os.makedirs(opts.save_val_results_to, exist_ok=True)
+
     with torch.no_grad():
         model = model.eval()
         for img_path in tqdm(image_files):
             ext = os.path.basename(img_path).split('.')[-1]
             img_name = os.path.basename(img_path)[:-len(ext)-1]
             img = Image.open(img_path).convert('RGB')
-            img = transform(img).unsqueeze(0) # To tensor of NCHW
-            img = img.to(device)
-            
-            pred = model(img).max(1)[1].cpu().numpy()[0] # HW
-            colorized_preds = decode_fn(pred).astype('uint8')
-            colorized_preds = Image.fromarray(colorized_preds)
+            w, h = img.size
+            mode = "slide" if (h > opts.tile_size or w > opts.tile_size) else "pad"
+            pred = infer_image(
+                model,
+                img,
+                transform,
+                device,
+                num_classes=opts.num_classes,
+                tile_size=opts.tile_size,
+                stride=opts.stride,
+            )
             if opts.save_val_results_to:
-                colorized_preds.save(os.path.join(opts.save_val_results_to, img_name+'.png'))
+                export_prediction(
+                    pred,
+                    img_name,
+                    Path(opts.save_val_results_to),
+                    decode_fn,
+                    class_info=class_info,
+                    save_pixel_zh=not opts.no_save_pixel_zh,
+                )
+            tqdm.write(f"{img_name}: {w}x{h} -> {mode}, pred {pred.shape[1]}x{pred.shape[0]}")
 
 if __name__ == '__main__':
     main()
